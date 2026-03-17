@@ -49,6 +49,7 @@ impl From<Command> for latest::Command {
             command: value.command,
             args: value.args,
             env: value.env,
+            transport: extension::LspTransport::default(),
         }
     }
 }

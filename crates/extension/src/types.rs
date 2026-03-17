@@ -15,6 +15,26 @@ pub use slash_command::*;
 /// A list of environment variables.
 pub type EnvVars = Vec<(String, String)>;
 
+/// The transport mechanism for communicating with a language server.
+#[derive(Debug, Clone, Default)]
+pub enum LspTransport {
+    /// Use stdin/stdout for communication (default).
+    #[default]
+    Stdio,
+    /// Use a named pipe (Unix domain socket) for communication.
+    Pipe {
+        /// The CLI argument used to pass the pipe path to the language server.
+        arg_name: String,
+    },
+    /// Use a TCP socket for communication.
+    Tcp {
+        /// The TCP port number.
+        port: u16,
+        /// The host address.
+        host: std::net::Ipv4Addr,
+    },
+}
+
 /// A command.
 pub struct Command {
     /// The command to execute.
@@ -23,6 +43,8 @@ pub struct Command {
     pub args: Vec<String>,
     /// The environment variables to set for the command.
     pub env: EnvVars,
+    /// The transport mechanism for language server communication.
+    pub transport: LspTransport,
 }
 
 impl std::fmt::Debug for Command {
@@ -37,6 +59,7 @@ impl std::fmt::Debug for Command {
             .field("command", &self.command)
             .field("args", &self.args)
             .field("env", &filtered_env)
+            .field("transport", &self.transport)
             .finish()
     }
 }

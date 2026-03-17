@@ -409,6 +409,13 @@ pub struct PromptResponseContext {
 pub trait LspAdapter: 'static + Send + Sync + DynLspInstaller {
     fn name(&self) -> LanguageServerName;
 
+    /// Returns the transport mechanism to use for communicating with this language server.
+    ///
+    /// Defaults to [`LspTransport::Stdio`], which uses stdin/stdout.
+    fn transport(&self) -> lsp::LspTransport {
+        lsp::LspTransport::Stdio
+    }
+
     fn process_diagnostics(
         &self,
         _: &mut lsp::PublishDiagnosticsParams,

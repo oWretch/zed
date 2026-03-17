@@ -25,6 +25,7 @@ use smol::{
 };
 use util::command::{Child, Stdio};
 
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::{
     any::TypeId,
@@ -71,6 +72,38 @@ pub enum IoKind {
     StdOut,
     StdIn,
     StdErr,
+}
+
+/// The transport mechanism for communicating with a language server.
+#[derive(Clone, Debug, Serialize)]
+pub enum LspTransport {
+    /// Use stdin/stdout for communication (default).
+    Stdio,
+    /// Use a named pipe (Unix domain socket) for communication.
+    ///
+    /// Zed creates a temporary socket, passes its path to the language server
+    /// using the specified CLI argument (e.g., `"--pipe"`), and communicates
+    /// over the resulting connection.
+    Pipe {
+        /// The CLI argument used to pass the pipe path to the language server.
+        arg_name: String,
+    },
+    /// Use a TCP socket for communication.
+    ///
+    /// Zed spawns the language server process and then connects to it at the
+    /// specified host and port.
+    Tcp {
+        /// The TCP port number.
+        port: u16,
+        /// The host address (defaults to localhost if not specified).
+        host: Ipv4Addr,
+    },
+}
+
+impl Default for LspTransport {
+    fn default() -> Self {
+        LspTransport::Stdio
+    }
 }
 
 /// Represents a launchable language server. This can either be a standalone binary or the path
@@ -443,6 +476,254 @@ impl LanguageServer {
             Some(stderr),
             stderr_capture,
             Some(server),
+            code_action_kinds,
+            binary,
+            root_uri,
+            workspace_folders,
+            cx,
+            move |notification| {
+                log::info!(
+                    "Language server with id {} sent unhandled notification {}:\n{}",
+                    server_id,
+                    notification.method,
+                    serde_json::to_string_pretty(&notification.params).unwrap(),
+                );
+                false
+            },
+        );
+
+        Ok(server)
+    }
+
+    /// Starts a language server process with the specified transport mechanism.
+    ///
+    /// For [`LspTransport::Stdio`], this behaves identically to [`new()`](Self::new).
+    /// For [`LspTransport::Pipe`], Zed creates a temporary Unix domain socket, passes
+    /// the socket path to the language server via the configured CLI argument, and
+    /// communicates over the resulting connection.
+    /// For [`LspTransport::Tcp`], Zed spawns the language server and connects to it
+    /// at the specified host and port.
+    pub async fn new_with_transport(
+        stderr_capture: Arc<Mutex<Option<String>>>,
+        server_id: LanguageServerId,
+        server_name: LanguageServerName,
+        binary: LanguageServerBinary,
+        transport: LspTransport,
+        root_path: &Path,
+        code_action_kinds: Option<Vec<CodeActionKind>>,
+        workspace_folders: Option<Arc<Mutex<BTreeSet<Uri>>>>,
+        cx: &mut AsyncApp,
+    ) -> Result<Self> {
+        match transport {
+            LspTransport::Stdio => Self::new(
+                stderr_capture,
+                server_id,
+                server_name,
+                binary,
+                root_path,
+                code_action_kinds,
+                workspace_folders,
+                cx,
+            ),
+            LspTransport::Pipe { arg_name } => Self::new_pipe(
+                stderr_capture,
+                server_id,
+                server_name,
+                binary,
+                &arg_name,
+                root_path,
+                code_action_kinds,
+                workspace_folders,
+                cx,
+            )
+            .await,
+            LspTransport::Tcp { port, host } => Self::new_tcp(
+                stderr_capture,
+                server_id,
+                server_name,
+                binary,
+                host,
+                port,
+                root_path,
+                code_action_kinds,
+                workspace_folders,
+                cx,
+            )
+            .await,
+        }
+    }
+
+    /// Starts a language server using named pipe (Unix domain socket) transport.
+    async fn new_pipe(
+        stderr_capture: Arc<Mutex<Option<String>>>,
+        server_id: LanguageServerId,
+        server_name: LanguageServerName,
+        binary: LanguageServerBinary,
+        pipe_arg_name: &str,
+        root_path: &Path,
+        code_action_kinds: Option<Vec<CodeActionKind>>,
+        workspace_folders: Option<Arc<Mutex<BTreeSet<Uri>>>>,
+        cx: &mut AsyncApp,
+    ) -> Result<Self> {
+        let working_dir = if root_path.is_dir() {
+            root_path
+        } else {
+            root_path.parent().unwrap_or_else(|| Path::new("/"))
+        };
+        let root_uri = Uri::from_file_path(working_dir)
+            .map_err(|()| anyhow!("{working_dir:?} is not a valid URI"))?;
+
+        let pipe_dir = tempfile::tempdir()
+            .context("failed to create temporary directory for LSP pipe")?;
+        let pipe_path = pipe_dir.path().join(format!("zed-lsp-{}.sock", server_id));
+
+        log::info!(
+            "starting language server process with pipe transport. binary path: \
+            {:?}, working directory: {:?}, pipe: {:?}, args: {:?}",
+            binary.path,
+            working_dir,
+            pipe_path,
+            &binary.arguments,
+        );
+
+        let listener = net::async_net::UnixListener::bind(&pipe_path)
+            .context("failed to create Unix socket for LSP pipe transport")?;
+
+        let mut command = util::command::new_command(&binary.path);
+        command
+            .current_dir(working_dir)
+            .args(&binary.arguments)
+            .arg(pipe_arg_name)
+            .arg(&pipe_path)
+            .envs(binary.env.clone().unwrap_or_default())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to spawn command {command:?}"))?;
+
+        let stderr = child.stderr.take();
+
+        let (stream, _) = listener
+            .accept()
+            .await
+            .context("failed to accept connection on LSP pipe")?;
+
+        // Keep the temp directory alive so the socket file isn't deleted
+        let _pipe_dir_handle = pipe_dir;
+
+        let (reader, writer) = futures::AsyncReadExt::split(stream);
+        let server = Self::new_internal(
+            server_id,
+            server_name,
+            writer,
+            reader,
+            stderr,
+            stderr_capture,
+            Some(child),
+            code_action_kinds,
+            binary,
+            root_uri,
+            workspace_folders,
+            cx,
+            move |notification| {
+                log::info!(
+                    "Language server with id {} sent unhandled notification {}:\n{}",
+                    server_id,
+                    notification.method,
+                    serde_json::to_string_pretty(&notification.params).unwrap(),
+                );
+                false
+            },
+        );
+
+        Ok(server)
+    }
+
+    /// Starts a language server using TCP socket transport.
+    async fn new_tcp(
+        stderr_capture: Arc<Mutex<Option<String>>>,
+        server_id: LanguageServerId,
+        server_name: LanguageServerName,
+        binary: LanguageServerBinary,
+        host: Ipv4Addr,
+        port: u16,
+        root_path: &Path,
+        code_action_kinds: Option<Vec<CodeActionKind>>,
+        workspace_folders: Option<Arc<Mutex<BTreeSet<Uri>>>>,
+        cx: &mut AsyncApp,
+    ) -> Result<Self> {
+        let working_dir = if root_path.is_dir() {
+            root_path
+        } else {
+            root_path.parent().unwrap_or_else(|| Path::new("/"))
+        };
+        let root_uri = Uri::from_file_path(working_dir)
+            .map_err(|()| anyhow!("{working_dir:?} is not a valid URI"))?;
+
+        log::info!(
+            "starting language server process with TCP transport. binary path: \
+            {:?}, working directory: {:?}, address: {}:{}, args: {:?}",
+            binary.path,
+            working_dir,
+            host,
+            port,
+            &binary.arguments,
+        );
+
+        let mut command = util::command::new_command(&binary.path);
+        command
+            .current_dir(working_dir)
+            .args(&binary.arguments)
+            .envs(binary.env.clone().unwrap_or_default())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to spawn command {command:?}"))?;
+
+        let stderr = child.stderr.take();
+        let address = std::net::SocketAddrV4::new(host, port);
+
+        const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+        const TCP_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+        let deadline = Instant::now() + TCP_CONNECT_TIMEOUT;
+        let stream = loop {
+            match smol::net::TcpStream::connect(address).await {
+                Ok(stream) => break stream,
+                Err(err) => {
+                    if Instant::now() >= deadline {
+                        return Err(anyhow!(
+                            "timed out connecting to language server at {address}: {err}"
+                        ));
+                    }
+                    if let Ok(Some(status)) = child.try_status() {
+                        return Err(anyhow!(
+                            "language server process exited with {status} \
+                             before TCP connection could be established"
+                        ));
+                    }
+                    smol::Timer::after(TCP_RETRY_DELAY).await;
+                }
+            }
+        };
+
+        let (reader, writer) = futures::AsyncReadExt::split(stream);
+        let server = Self::new_internal(
+            server_id,
+            server_name,
+            writer,
+            reader,
+            stderr,
+            stderr_capture,
+            Some(child),
             code_action_kinds,
             binary,
             root_uri,
