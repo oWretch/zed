@@ -710,7 +710,7 @@ impl LanguageServer {
                              before TCP connection could be established"
                         ));
                     }
-                    smol::Timer::after(TCP_RETRY_DELAY).await;
+                    cx.background_executor().timer(TCP_RETRY_DELAY).await;
                 }
             }
         };
