@@ -2511,4 +2511,90 @@ mod tests {
             "root_path should be derived from root_uri"
         );
     }
+
+    #[test]
+    fn test_lsp_transport_default() {
+        let transport = LspTransport::default();
+        assert!(matches!(transport, LspTransport::Stdio));
+    }
+
+    #[test]
+    fn test_lsp_transport_pipe_construction() {
+        let transport = LspTransport::Pipe {
+            arg_name: "--pipe".to_string(),
+        };
+        assert!(matches!(transport, LspTransport::Pipe { .. }));
+        if let LspTransport::Pipe { arg_name } = transport {
+            assert_eq!(arg_name, "--pipe");
+        }
+    }
+
+    #[test]
+    fn test_lsp_transport_tcp_construction() {
+        let transport = LspTransport::Tcp {
+            port: 8080,
+            host: std::net::Ipv4Addr::LOCALHOST,
+        };
+        assert!(matches!(transport, LspTransport::Tcp { .. }));
+        if let LspTransport::Tcp { port, host } = transport {
+            assert_eq!(port, 8080);
+            assert_eq!(host, std::net::Ipv4Addr::LOCALHOST);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_new_with_transport_stdio(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+
+        let (server, mut fake) = FakeLanguageServer::new(
+            LanguageServerId(0),
+            LanguageServerBinary {
+                path: "path/to/language-server".into(),
+                arguments: vec![],
+                env: None,
+            },
+            "stdio-test".to_string(),
+            Default::default(),
+            &mut cx.to_async(),
+        );
+
+        let server = cx
+            .update(|cx| {
+                let params = server.default_initialize_params(false, false, cx);
+                server.initialize(
+                    params,
+                    DidChangeConfigurationParams {
+                        settings: Default::default(),
+                    }
+                    .into(),
+                    DEFAULT_LSP_REQUEST_TIMEOUT,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        server
+            .notify::<notification::DidOpenTextDocument>(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem::new(
+                    Uri::from_str("file://test").unwrap(),
+                    "test".to_string(),
+                    0,
+                    "hello".to_string(),
+                ),
+            })
+            .unwrap();
+
+        let opened = fake
+            .receive_notification::<notification::DidOpenTextDocument>()
+            .await;
+        assert_eq!(opened.text_document.uri.as_str(), "file://test/");
+
+        fake.set_request_handler::<request::Shutdown, _, _>(|_, _| async move { Ok(()) });
+        drop(server);
+        cx.run_until_parked();
+        fake.receive_notification::<notification::Exit>().await;
+    }
 }
