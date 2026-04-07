@@ -40,10 +40,10 @@ impl From<Command> for latest::Command {
             command: value.command,
             args: value.args,
             env: value.env,
-            transport: extension::LspTransport::default(),
         }
     }
 }
+
 impl From<SettingsLocation> for latest::SettingsLocation {
     fn from(value: SettingsLocation) -> Self {
         Self {

@@ -411,7 +411,7 @@ pub trait LspAdapter: 'static + Send + Sync + DynLspInstaller {
 
     /// Returns the transport mechanism to use for communicating with this language server.
     ///
-    /// Defaults to [`LspTransport::Stdio`], which uses stdin/stdout.
+    /// Defaults to [`LspTransport::Stdio`], which uses stdin/stdout for backwards compatibility.
     fn transport(&self) -> lsp::LspTransport {
         lsp::LspTransport::Stdio
     }

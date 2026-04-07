@@ -82,7 +82,6 @@ impl From<Command> for extension::Command {
             command: value.command.into(),
             args: value.args,
             env: value.env,
-            transport: extension::LspTransport::default(),
         }
     }
 }
