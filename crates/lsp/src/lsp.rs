@@ -25,6 +25,7 @@ use smol::{
 };
 use util::command::{Child, Stdio};
 
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::{
     any::TypeId,
@@ -71,6 +72,38 @@ pub enum IoKind {
     StdOut,
     StdIn,
     StdErr,
+}
+
+/// The transport mechanism for communicating with a language server.
+#[derive(Clone, Debug, Serialize)]
+pub enum LspTransport {
+    /// Use stdin/stdout for communication (default).
+    Stdio,
+    /// Use a named pipe (Unix domain socket) for communication.
+    ///
+    /// Zed creates a temporary socket, passes its path to the language server
+    /// using the specified CLI argument (e.g., `"--pipe"`), and communicates
+    /// over the resulting connection.
+    Pipe {
+        /// The CLI argument used to pass the pipe path to the language server.
+        arg_name: String,
+    },
+    /// Use a TCP socket for communication.
+    ///
+    /// Zed spawns the language server process and then connects to it at the
+    /// specified host and port.
+    Tcp {
+        /// The TCP port number.
+        port: u16,
+        /// The host address (defaults to localhost if not specified).
+        host: Ipv4Addr,
+    },
+}
+
+impl Default for LspTransport {
+    fn default() -> Self {
+        LspTransport::Stdio
+    }
 }
 
 /// Represents a launchable language server. This can either be a standalone binary or the path
@@ -443,6 +476,254 @@ impl LanguageServer {
             Some(stderr),
             stderr_capture,
             Some(server),
+            code_action_kinds,
+            binary,
+            root_uri,
+            workspace_folders,
+            cx,
+            move |notification| {
+                log::info!(
+                    "Language server with id {} sent unhandled notification {}:\n{}",
+                    server_id,
+                    notification.method,
+                    serde_json::to_string_pretty(&notification.params).unwrap(),
+                );
+                false
+            },
+        );
+
+        Ok(server)
+    }
+
+    /// Starts a language server process with the specified transport mechanism.
+    ///
+    /// For [`LspTransport::Stdio`], this behaves identically to [`new()`](Self::new).
+    /// For [`LspTransport::Pipe`], Zed creates a temporary Unix domain socket, passes
+    /// the socket path to the language server via the configured CLI argument, and
+    /// communicates over the resulting connection.
+    /// For [`LspTransport::Tcp`], Zed spawns the language server and connects to it
+    /// at the specified host and port.
+    pub async fn new_with_transport(
+        stderr_capture: Arc<Mutex<Option<String>>>,
+        server_id: LanguageServerId,
+        server_name: LanguageServerName,
+        binary: LanguageServerBinary,
+        transport: LspTransport,
+        root_path: &Path,
+        code_action_kinds: Option<Vec<CodeActionKind>>,
+        workspace_folders: Option<Arc<Mutex<BTreeSet<Uri>>>>,
+        cx: &mut AsyncApp,
+    ) -> Result<Self> {
+        match transport {
+            LspTransport::Stdio => Self::new(
+                stderr_capture,
+                server_id,
+                server_name,
+                binary,
+                root_path,
+                code_action_kinds,
+                workspace_folders,
+                cx,
+            ),
+            LspTransport::Pipe { arg_name } => Self::new_pipe(
+                stderr_capture,
+                server_id,
+                server_name,
+                binary,
+                &arg_name,
+                root_path,
+                code_action_kinds,
+                workspace_folders,
+                cx,
+            )
+            .await,
+            LspTransport::Tcp { port, host } => Self::new_tcp(
+                stderr_capture,
+                server_id,
+                server_name,
+                binary,
+                host,
+                port,
+                root_path,
+                code_action_kinds,
+                workspace_folders,
+                cx,
+            )
+            .await,
+        }
+    }
+
+    /// Starts a language server using named pipe (Unix domain socket) transport.
+    async fn new_pipe(
+        stderr_capture: Arc<Mutex<Option<String>>>,
+        server_id: LanguageServerId,
+        server_name: LanguageServerName,
+        binary: LanguageServerBinary,
+        pipe_arg_name: &str,
+        root_path: &Path,
+        code_action_kinds: Option<Vec<CodeActionKind>>,
+        workspace_folders: Option<Arc<Mutex<BTreeSet<Uri>>>>,
+        cx: &mut AsyncApp,
+    ) -> Result<Self> {
+        let working_dir = if root_path.is_dir() {
+            root_path
+        } else {
+            root_path.parent().unwrap_or_else(|| Path::new("/"))
+        };
+        let root_uri = Uri::from_file_path(working_dir)
+            .map_err(|()| anyhow!("{working_dir:?} is not a valid URI"))?;
+
+        let pipe_dir = tempfile::tempdir()
+            .context("failed to create temporary directory for LSP pipe")?;
+        let pipe_path = pipe_dir.path().join(format!("zed-lsp-{}.sock", server_id));
+
+        log::info!(
+            "starting language server process with pipe transport. binary path: \
+            {:?}, working directory: {:?}, pipe: {:?}, args: {:?}",
+            binary.path,
+            working_dir,
+            pipe_path,
+            &binary.arguments,
+        );
+
+        let listener = net::async_net::UnixListener::bind(&pipe_path)
+            .context("failed to create Unix socket for LSP pipe transport")?;
+
+        let mut command = util::command::new_command(&binary.path);
+        command
+            .current_dir(working_dir)
+            .args(&binary.arguments)
+            .arg(pipe_arg_name)
+            .arg(&pipe_path)
+            .envs(binary.env.clone().unwrap_or_default())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to spawn command {command:?}"))?;
+
+        let stderr = child.stderr.take();
+
+        let (stream, _) = listener
+            .accept()
+            .await
+            .context("failed to accept connection on LSP pipe")?;
+
+        // Keep the temp directory alive so the socket file isn't deleted
+        let _pipe_dir_handle = pipe_dir;
+
+        let (reader, writer) = futures::AsyncReadExt::split(stream);
+        let server = Self::new_internal(
+            server_id,
+            server_name,
+            writer,
+            reader,
+            stderr,
+            stderr_capture,
+            Some(child),
+            code_action_kinds,
+            binary,
+            root_uri,
+            workspace_folders,
+            cx,
+            move |notification| {
+                log::info!(
+                    "Language server with id {} sent unhandled notification {}:\n{}",
+                    server_id,
+                    notification.method,
+                    serde_json::to_string_pretty(&notification.params).unwrap(),
+                );
+                false
+            },
+        );
+
+        Ok(server)
+    }
+
+    /// Starts a language server using TCP socket transport.
+    async fn new_tcp(
+        stderr_capture: Arc<Mutex<Option<String>>>,
+        server_id: LanguageServerId,
+        server_name: LanguageServerName,
+        binary: LanguageServerBinary,
+        host: Ipv4Addr,
+        port: u16,
+        root_path: &Path,
+        code_action_kinds: Option<Vec<CodeActionKind>>,
+        workspace_folders: Option<Arc<Mutex<BTreeSet<Uri>>>>,
+        cx: &mut AsyncApp,
+    ) -> Result<Self> {
+        let working_dir = if root_path.is_dir() {
+            root_path
+        } else {
+            root_path.parent().unwrap_or_else(|| Path::new("/"))
+        };
+        let root_uri = Uri::from_file_path(working_dir)
+            .map_err(|()| anyhow!("{working_dir:?} is not a valid URI"))?;
+
+        log::info!(
+            "starting language server process with TCP transport. binary path: \
+            {:?}, working directory: {:?}, address: {}:{}, args: {:?}",
+            binary.path,
+            working_dir,
+            host,
+            port,
+            &binary.arguments,
+        );
+
+        let mut command = util::command::new_command(&binary.path);
+        command
+            .current_dir(working_dir)
+            .args(&binary.arguments)
+            .envs(binary.env.clone().unwrap_or_default())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to spawn command {command:?}"))?;
+
+        let stderr = child.stderr.take();
+        let address = std::net::SocketAddrV4::new(host, port);
+
+        const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+        const TCP_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+        let deadline = Instant::now() + TCP_CONNECT_TIMEOUT;
+        let stream = loop {
+            match smol::net::TcpStream::connect(address).await {
+                Ok(stream) => break stream,
+                Err(err) => {
+                    if Instant::now() >= deadline {
+                        return Err(anyhow!(
+                            "timed out connecting to language server at {address}: {err}"
+                        ));
+                    }
+                    if let Ok(Some(status)) = child.try_status() {
+                        return Err(anyhow!(
+                            "language server process exited with {status} \
+                             before TCP connection could be established"
+                        ));
+                    }
+                    cx.background_executor().timer(TCP_RETRY_DELAY).await;
+                }
+            }
+        };
+
+        let (reader, writer) = futures::AsyncReadExt::split(stream);
+        let server = Self::new_internal(
+            server_id,
+            server_name,
+            writer,
+            reader,
+            stderr,
+            stderr_capture,
+            Some(child),
             code_action_kinds,
             binary,
             root_uri,
@@ -2229,5 +2510,91 @@ mod tests {
             expected_path.to_string_lossy(),
             "root_path should be derived from root_uri"
         );
+    }
+
+    #[test]
+    fn test_lsp_transport_default() {
+        let transport = LspTransport::default();
+        assert!(matches!(transport, LspTransport::Stdio));
+    }
+
+    #[test]
+    fn test_lsp_transport_pipe_construction() {
+        let transport = LspTransport::Pipe {
+            arg_name: "--pipe".to_string(),
+        };
+        assert!(matches!(transport, LspTransport::Pipe { .. }));
+        if let LspTransport::Pipe { arg_name } = transport {
+            assert_eq!(arg_name, "--pipe");
+        }
+    }
+
+    #[test]
+    fn test_lsp_transport_tcp_construction() {
+        let transport = LspTransport::Tcp {
+            port: 8080,
+            host: std::net::Ipv4Addr::LOCALHOST,
+        };
+        assert!(matches!(transport, LspTransport::Tcp { .. }));
+        if let LspTransport::Tcp { port, host } = transport {
+            assert_eq!(port, 8080);
+            assert_eq!(host, std::net::Ipv4Addr::LOCALHOST);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_new_with_transport_stdio(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+
+        let (server, mut fake) = FakeLanguageServer::new(
+            LanguageServerId(0),
+            LanguageServerBinary {
+                path: "path/to/language-server".into(),
+                arguments: vec![],
+                env: None,
+            },
+            "stdio-test".to_string(),
+            Default::default(),
+            &mut cx.to_async(),
+        );
+
+        let server = cx
+            .update(|cx| {
+                let params = server.default_initialize_params(false, false, cx);
+                server.initialize(
+                    params,
+                    DidChangeConfigurationParams {
+                        settings: Default::default(),
+                    }
+                    .into(),
+                    DEFAULT_LSP_REQUEST_TIMEOUT,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        server
+            .notify::<notification::DidOpenTextDocument>(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem::new(
+                    Uri::from_str("file://test").unwrap(),
+                    "test".to_string(),
+                    0,
+                    "hello".to_string(),
+                ),
+            })
+            .unwrap();
+
+        let opened = fake
+            .receive_notification::<notification::DidOpenTextDocument>()
+            .await;
+        assert_eq!(opened.text_document.uri.as_str(), "file://test/");
+
+        fake.set_request_handler::<request::Shutdown, _, _>(|_, _| async move { Ok(()) });
+        drop(server);
+        cx.run_until_parked();
+        fake.receive_notification::<notification::Exit>().await;
     }
 }

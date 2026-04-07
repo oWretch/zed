@@ -500,16 +500,19 @@ impl LocalLspStore {
                 }
 
                 let code_action_kinds = adapter.code_action_kinds();
-                lsp::LanguageServer::new(
+                let transport = adapter.adapter.transport();
+                lsp::LanguageServer::new_with_transport(
                     stderr_capture,
                     server_id,
                     server_name,
                     binary,
+                    transport,
                     &worktree_abs_path,
                     code_action_kinds,
                     Some(pending_workspace_folders),
                     cx,
                 )
+                .await
             }
         });
 
